@@ -1,74 +1,61 @@
-# DidinskaGridV2 v2.00 - Petunjuk Pemasangan
+# DidinskaGridV2 v2.03 - Provider AI Bisa Custom
 
-Isi ZIP ini HANYA file yang berubah/baru. File lain (AISummarizer.mqh,
-NativeDecisionEngine.mqh, NewsAPI.mqh) tidak disentuh.
+ZIP ini hanya berisi file yang berubah dari v2.02 (pasang di atas v2.02):
+DidinskaGridV2.mq5, Include/GroqClient.mqh, worker/ea-proxy-worker.js.
 
-| File | Status |
+## Provider yang didukung
+| Pilihan di EA (InpAIProvider) | Keterangan |
 |---|---|
-| DidinskaGridV2.mq5 | diubah besar |
-| Include/GroqClient.mqh | diubah (mode proxy + batch) |
-| Include/Analysts.mqh | diubah (panggilan paralel via proxy) |
-| Include/MarketData.mqh | diubah (handle sekali, candle tertutup, fix pola candle) |
-| Include/TelegramNotify.mqh | diubah (UTF-8, pesan bebas) |
-| Include/NewsFilter.mqh | BARU (kalender MT5) |
-| Include/DecisionJournal.mqh | BARU (jurnal + akurasi) |
-| worker/ea-proxy-worker.js | BARU (Cloudflare Worker) |
+| AIP_GROQ | Groq (bawaan) |
+| AIP_OPENROUTER | OpenRouter (https://openrouter.ai/api/v1) |
+| AIP_OPENAI | OpenAI (https://api.openai.com/v1) |
+| AIP_ANTHROPIC | Claude lewat Messages API native |
+| AIP_CUSTOM | Penyedia lain yang OpenAI-compatible (FastRouter, DeepSeek, Together, dll). Cek dokumen penyedia: harus punya endpoint chat/completions |
 
-NewsAPI.mqh tidak lagi di-include. Boleh dibiarkan atau dihapus.
+Isi juga `InpAIModel` dengan NAMA MODEL SESUAI PROVIDER (beda provider beda penamaan).
 
-## LANGKAH 0 - Ganti semua API key (WAJIB)
-Key Groq, NewsAPI, dan token Telegram yang lama tertulis di kode.
-1. Groq: buat key baru, hapus (revoke) yang lama.
-2. NewsAPI: tidak dipakai lagi, hapus key lama.
-3. Telegram: di @BotFather kirim /revoke lalu pilih bot -> token baru.
-Kode baru TIDAK menyimpan key apa pun (semua default kosong).
+## Jalur Worker (disarankan) - langkah
+1. Cloudflare -> Worker `ea-proxy` -> Edit code -> tempel isi `worker/ea-proxy-worker.js` baru -> Deploy.
+2. Settings -> Variables and Secrets. Key dipisah per provider:
+   - Groq: `GROQ_API_KEYS`
+   - OpenRouter: `OPENROUTER_API_KEYS`
+   - OpenAI: `OPENAI_API_KEYS`
+   - Anthropic: `ANTHROPIC_API_KEYS`
+   - Custom: `CUSTOM_API_KEYS` DAN `CUSTOM_BASE_URL` (contoh https://api.penyedia.com/v1, wajib https)
+   Tiap variabel: key dipisah koma atau satu baris satu key. Kalau lebih dari ~85 key, lanjutkan di
+   `..._API_KEYS_2` sampai `_9`.
+3. Buka URL Worker di browser: akan tampil jumlah key per provider, mis. {"groq":100,"openrouter":0,...}.
+4. Di EA: InpProxyUrl + InpProxyToken (sama seperti sebelumnya), pilih InpAIProvider dan isi InpAIModel.
+   Provider bisa diganti dari EA tanpa mengubah Worker (selama key provider itu sudah ada di Worker).
+5. Di MT5 cukup izinkan URL Worker di Allow WebRequest (alamat provider tidak diakses langsung oleh MT5).
 
-## LANGKAH 1 - Pasang Worker (disarankan)
-1. Cloudflare dashboard -> Workers & Pages -> Create -> Worker -> beri nama, misal `ea-proxy` -> Deploy.
-2. Edit code -> hapus isi bawaan -> tempel seluruh isi `worker/ea-proxy-worker.js` -> Deploy.
-3. Settings -> Variables and Secrets -> tambah (tipe Secret):
-   - `EA_TOKEN` = kata sandi acak panjang buatan Anda
-   - `GROQ_API_KEY` = key Groq BARU
-   - (opsional) `GROQ_API_KEY_2` = key cadangan
-4. Salin URL Worker, misal `https://ea-proxy.namamu.workers.dev`.
-5. Tes: buka URL itu di browser HP. Harus muncul `{"service":"didinska-ea-proxy","status":"hidup"}`.
+## Jalur key langsung (tanpa Worker)
+- Isi InpApiKeyPool / file groq_keys.txt / slot lama dengan key PROVIDER YANG DIPILIH.
+- Untuk Custom, isi `InpAIBaseUrl`. Untuk provider lain boleh dikosongkan.
+- Izinkan host provider di Allow WebRequest (mis. https://openrouter.ai, https://api.anthropic.com).
 
-## LANGKAH 2 - Pasang EA di MT5 (PC/VPS tempat EA berjalan)
-1. Timpa file di folder `MQL5/Experts/<folder EA Anda>/`:
-   DidinskaGridV2.mq5 dan isi folder Include/ sesuai tabel di atas.
-2. Buka DidinskaGridV2.mq5 di MetaEditor -> Compile (F7).
-   Kirim ke saya semua pesan error/warning kalau ada.
-3. MT5: Tools -> Options -> Expert Advisors -> centang "Allow WebRequest for listed URL"
-   -> tambah URL Worker Anda (dan https://api.telegram.org untuk Telegram).
-4. Pasang EA di chart XAUUSD, tab Inputs:
-   - InpProxyUrl = URL Worker, InpProxyToken = EA_TOKEN
-   - Telegram: isi InpTelegramBotToken & InpTelegramChatId yang baru
-   - InpBrokerGmtOffset = offset GMT server broker Anda
-   - Cek jam filter: InpFridayStopNewHour / InpFridayCloseHour (jam SERVER broker)
-5. Mulai di akun DEMO minimal 4-6 minggu.
+## Catatan per provider
+- Anthropic: tidak ada "JSON mode". Prompt sudah meminta JSON dan Worker membersihkan pembungkus ```json.
+  Kredit habis dilaporkan sebagai HTTP 400; ini sudah dikenali (key diistirahatkan).
+- OpenAI: model seri gpt-5/o menolak `temperature` selain bawaan -> isi InpAITemperature = -1 (tidak dikirim).
+  Field batas token otomatis `max_completion_tokens`.
+- OpenRouter: nama model berformat vendor/model. Ada model yang tidak mendukung response_format;
+  kalau muncul error 400, set InpAIExtraJson menjadi kosong.
+- Groq/model reasoning: bawaan `reasoning_effort=low`. Di provider lain field ini TIDAK dikirim.
+- InpAIExtraJson: potongan JSON TANPA kurung kurawal, contoh:
+  "response_format":{"type":"json_object"}
+  Untuk provider yang ingin dikustom lebih jauh. Di mode Worker nilai ini dikirim ke Worker sebagai objek.
 
-## Input baru yang penting
-- InpMaxBasketRiskPct (2.0): batas risiko total 1 grid. Lot otomatis diperkecil.
-- InpMaxLayersPerSide (4): batas layer per sisi.
-- InpMaxConsecLosses (3) + InpLossCooldownMin (60): jeda setelah 3 basket rugi beruntun.
-- InpNewsBlackoutBefore/After (20/15 menit): pending dihapus di sekitar berita HIGH.
-- InpNativeGate: veto Native terhadap AI (default: veto kalau berlawanan).
-- InpUseATRGridDistance (true) + InpGridDistanceATR (0.5): jarak grid pakai ATR.
-- InpEnableJournal (true): file CSV di MQL5/Files (lihat bawah).
+## Keamanan
+- EA TIDAK mengirim alamat provider ke Worker. Alamat ada di kode Worker (atau CUSTOM_BASE_URL milik Anda).
+  Jadi kalau token EA bocor, key tidak bisa dibelokkan ke server orang lain.
+- Key tiap provider terpisah; key Groq tidak pernah dikirim ke OpenRouter dan sebaliknya.
+- Prompt berisi data pasar & ringkasan kalender (bukan data pribadi). Router pihak ketiga
+  meneruskan prompt ke model di belakangnya; ketahui kebijakan data penyedianya.
 
-## Melanjutkan setelah HALT PERMANEN (peak drawdown)
-Peak equity sekarang tersimpan walau EA di-restart. Untuk lanjut:
-set InpResetPeakOnInit = true -> pasang ulang EA -> setelah jalan, kembalikan ke false.
-
-## Membaca hasil jurnal (MQL5/Files)
-- `DidinskaGridV2_XAUUSD_decisions.csv`: satu baris per siklus (vote tiap analis).
-- `DidinskaGridV2_XAUUSD_outcomes.csv`: hasil harga setelah 60 menit, HIT/MISS per analis,
-  dibandingkan dengan Native. Kumpulkan puluhan sampai ratusan baris sebelum menyimpulkan.
-Kolom arah: 0 netral/WAIT, 1 naik/BUY, 2 turun/SELL, -1 analis gagal.
-
-## Batasan yang perlu diketahui
-- Strategy Tester: filter berita tidak aktif (kalender MT5 tidak ada di tester) dan
-  mode AI ON tidak bisa di-backtest. Gunakan MODE_AI_OFF untuk backtest.
-- WebRequest tetap memblokir EA selama panggilan berlangsung. Karena itu siklus AI
-  sengaja TIDAK dijalankan saat ada posisi terbuka.
-- Antrean evaluasi jurnal ada di memori: yang belum dievaluasi hilang saat EA di-restart.
+## Yang belum diuji
+Worker diuji dengan server tiruan untuk tiap bentuk respons provider (OpenAI pretty-print,
+Groq ringkas, Anthropic dengan blok thinking, content null, kredit habis, model salah). Belum diuji
+ke API asli, dan bagian EA belum dikompilasi. Perilaku parameter model pihak ketiga bisa berubah;
+kalau ada HTTP 400, pesan error provider kini ikut tampil di log.
+Pindah provider/model = ubah satu hal per putaran, lalu bandingkan akurasi di jurnal.
