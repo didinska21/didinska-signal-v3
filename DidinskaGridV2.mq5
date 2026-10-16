@@ -30,7 +30,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Didinska Grid V2"
 #property link      ""
-#property version   "2.00"
+#property version   "2.03"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -78,11 +78,22 @@ input double   InpHighConfidenceThreshold = 0.75; // Di atas ini, grid cuma pasa
 input group "--- Ambang Keyakinan (berlaku AI ON maupun AI OFF) ---"
 input double   InpMinProbability       = 0.65;  // Probabilitas minimum sebelum grid boleh dibuka
 
+input group "--- Target Ekspansi Volatilitas (sesuai cara grid untung) ---"
+input bool     InpUseExpansionGate   = true;   // AI ON: grid hanya dibuka kalau peluang ekspansi cukup
+input double   InpExpansionATRMult   = 1.5;    // Definisi ekspansi: harga menjauh >= N x ATR (ke arah mana pun)
+input double   InpMinExpansionProb   = 0.50;   // Peluang ekspansi minimum agar grid boleh dibuka
+input bool     InpAllowSymmetricGrid = false;  // Izinkan grid 2 sisi saat arah WAIT tapi ekspansi tinggi (UJI dulu di demo)
+input double   InpSymmetricExpansionProb = 0.65; // Ambang ekspansi untuk grid simetris
+
 input group "--- AI - PROXY Cloudflare Worker (DISARANKAN) ---"
 input string   InpProxyUrl             = "";    // URL Worker, contoh https://ea-proxy.namamu.workers.dev (kosong = pakai key langsung di bawah)
 input string   InpProxyToken           = "";    // Token rahasia (sama dengan secret EA_TOKEN di Worker)
 
-input group "--- AI - 12 Slot API Key Groq LANGSUNG (kosongkan kalau pakai Proxy) ---"
+input group "--- AI - POOL BANYAK API KEY Groq LANGSUNG (cadangan Proxy / tanpa Worker) ---"
+input string   InpApiKeyPool         = "";               // key1,key2,key3,... (dipisah koma). Dirotasi otomatis, key mati/saldo habis dilewati
+input string   InpApiKeyFile         = "groq_keys.txt";  // File di MQL5\Files berisi key (koma/baris baru). Untuk puluhan-ratusan key. Kosongkan kalau tidak dipakai
+
+input group "--- AI - 12 Slot API Key Groq LANGSUNG (cara lama; kosongkan kalau pakai Proxy/Pool) ---"
 input string   InpApiKey_Analyst1    = "";  // Slot 1: AI Analis #1 - Trend
 input string   InpApiKey_Analyst2    = "";  // Slot 2: AI Analis #2 - Momentum
 input string   InpApiKey_Analyst3    = "";  // Slot 3: AI Analis #3 - Volatilitas
@@ -96,8 +107,15 @@ input string   InpApiKey_Analyst10   = "";  // Slot 10: AI Analis #10 - Risk Man
 input string   InpApiKey_Summarizer  = "";  // Slot 11: AI Penyimpul (keputusan final)
 input string   InpApiKey_Reserve     = "";  // Slot 12: CADANGAN UNIVERSAL
 
+input group "--- AI - Provider & Model (BISA CUSTOM) ---"
+input ENUM_AI_PROVIDER InpAIProvider = AIP_GROQ;   // Provider: Groq / OpenRouter / OpenAI / Anthropic / Custom (FastRouter dll)
+input string   InpAIModel            = "openai/gpt-oss-120b"; // Nama model SESUAI provider (mis. claude-haiku-5-5, gpt-4o-mini, openai/gpt-oss-120b)
+input string   InpAIBaseUrl          = "";         // Alamat API (kosong = bawaan provider). WAJIB untuk Custom, contoh https://api.contoh.com/v1. Hanya untuk jalur key langsung; di mode Worker alamat diatur di Worker
+input double   InpAITemperature      = 0.3;        // Temperature. Isi NEGATIF (mis. -1) kalau model menolak parameter ini (mis. gpt-5 / o-series)
+input string   InpAIExtraJson        = "auto";     // Field tambahan request. auto=bawaan provider, kosong=tanpa tambahan, atau potongan JSON tanpa kurung kurawal
+input string   InpAITokenParam       = "auto";     // Nama field batas token. auto = max_tokens (OpenAI: max_completion_tokens)
+
 input group "--- AI - Konfigurasi Umum ---"
-input string   InpGroqModel          = "openai/gpt-oss-120b"; // Model Groq
 input int      InpAIAnalysisInterval = 600;    // Interval Siklus Analisa AI Penuh (detik) - default 10 menit
 input int      InpAIMaxTokens        = 1500;   // Max token per panggilan AI (JANGAN di bawah 1000 - gpt-oss-120b butuh token utk reasoning+JSON)
 input int      InpAITimeoutMs        = 30000;  // Timeout tiap panggilan API (ms)
@@ -107,6 +125,7 @@ input ENUM_TIMEFRAMES InpWorkingTF   = PERIOD_M15; // Timeframe kerja utama
 input ENUM_TIMEFRAMES InpHigherTF    = PERIOD_H4;  // Timeframe lebih tinggi (MTF alignment)
 input string   InpMacroProxySymbol   = "EURUSD";   // Symbol proksi korelasi dolar (kalau DXY tidak tersedia)
 input string   InpDxySymbol          = "";         // Symbol Dollar Index broker (kosongkan kalau tidak ada)
+input string   InpYieldSymbol        = "";         // Symbol yield obligasi AS di broker, mis. US10Y (kosongkan kalau tidak ada)
 input int      InpBrokerGmtOffset    = 2;          // Offset GMT waktu server broker (jam), untuk deteksi sesi
 
 input group "--- Filter Berita (Kalender Ekonomi MT5) ---"
@@ -218,6 +237,7 @@ SMarketSnapshot   m_last_snapshot;
 SAnalystOpinion   m_last_opinions[];
 SFinalDecision    m_last_decision;
 bool              m_has_decision = false;
+bool              m_vetoed = false;          // keputusan siklus ini di-veto Native
 
 // Statistik harian (untuk laporan)
 int               m_day_cycles = 0;
@@ -387,6 +407,13 @@ int OnInit()
    // --- Mode proxy dulu, baru key langsung (dipakai sebagai cadangan) ---
    m_groq_client.SetProxy(InpProxyUrl, InpProxyToken);
 
+   // --- Pool banyak key (input koma + file) ---
+   int pool_input = m_groq_client.AddKeysFromText(InpApiKeyPool);
+   int pool_file  = (StringLen(InpApiKeyFile) > 0) ? m_groq_client.LoadKeysFromFile(InpApiKeyFile) : 0;
+   if(m_groq_client.PoolSize() > 0)
+      Print("Pool API key: ", m_groq_client.PoolSize(), " key aktif dimuat (dari input: ", pool_input,
+            ", dari file: ", pool_file, "). Rotasi otomatis, key mati dilewati.");
+
    string api_keys[12];
    api_keys[0] = InpApiKey_Analyst1;
    api_keys[1] = InpApiKey_Analyst2;
@@ -401,13 +428,17 @@ int OnInit()
    api_keys[10] = InpApiKey_Summarizer;
    api_keys[11] = InpApiKey_Reserve;
 
-   m_groq_client.Initialize(api_keys, InpGroqModel, InpAIMaxTokens, 0.3, InpAITimeoutMs);
+   m_groq_client.SetProvider((int)InpAIProvider, InpAIBaseUrl, InpAIExtraJson, InpAITokenParam);
+   m_groq_client.Initialize(api_keys, InpAIModel, InpAIMaxTokens, InpAITemperature, InpAITimeoutMs);
 
    m_analyst_engine = new CAnalystEngine(GetPointer(m_groq_client));
    m_ai_summarizer  = new CAISummarizer(GetPointer(m_groq_client));
+   m_analyst_engine.SetExpansionSpec(InpExpansionATRMult, InpJournalEvalMin);
 
    m_market_engine.Configure(_Symbol, InpWorkingTF, InpHigherTF,
                               InpMacroProxySymbol, InpDxySymbol, InpBrokerGmtOffset);
+
+   m_market_engine.SetYieldSymbol(InpYieldSymbol);
 
    m_atr_handle = iATR(_Symbol, InpWorkingTF, 14);
 
@@ -415,7 +446,7 @@ int OnInit()
       m_news_filter.Configure(InpNewsCurrencies, InpNewsBlackoutBefore, InpNewsBlackoutAfter, InpNewsWarnMinutes);
 
    m_telegram.Initialize(InpTelegramBotToken, InpTelegramChatId, InpUseTelegramNotify);
-   m_journal.Initialize(_Symbol, InpEnableJournal, InpJournalEvalMin);
+   m_journal.Initialize(_Symbol, InpEnableJournal, InpJournalEvalMin, InpExpansionATRMult);
 
    m_system_halted = false;
    m_peak_drawdown_halted = false;
@@ -428,17 +459,19 @@ int OnInit()
 
    m_last_decision.bias = FINAL_BIAS_WAIT;
 
-   Print("Didinska Grid V2 v2.00 Initialized");
+   Print("Didinska Grid V2 v2.03 Initialized");
+   Print("Provider AI: ", EnumToString(InpAIProvider), " | Model: ", InpAIModel);
    Print("Mode: ", (InpMode == MODE_AI_ON) ? "AI ON" : "AI OFF (Native, tanpa API - siap backtest)",
-         " | Proxy: ", m_groq_client.IsProxyEnabled() ? "AKTIF" : "tidak (key langsung)");
+         " | Proxy: ", m_groq_client.IsProxyEnabled() ? "AKTIF" : "tidak (key langsung)",
+         " | Pool key: ", m_groq_client.PoolSize());
    Print("News Filter: ", InpUseNewsFilter ? "ENABLED" : "DISABLED",
          " | Telegram: ", InpUseTelegramNotify ? "ENABLED" : "DISABLED",
          " | Basket risk max: ", DoubleToString(InpMaxBasketRiskPct, 2), "%");
 
-   if(InpMode == MODE_AI_ON && !m_groq_client.IsProxyEnabled() && StringLen(InpApiKey_Analyst1) == 0 &&
-      StringLen(InpApiKey_Reserve) == 0)
-      Print("PERINGATAN: Mode AI ON tapi Proxy URL & API key kosong -> semua panggilan AI akan gagal (fallback WAIT). ",
-            "Isi InpProxyUrl/InpProxyToken, atau pakai MODE_AI_OFF.");
+   if(InpMode == MODE_AI_ON && !m_groq_client.IsProxyEnabled() && m_groq_client.PoolSize() == 0 &&
+      StringLen(InpApiKey_Analyst5) == 0 && StringLen(InpApiKey_Reserve) == 0)
+      Print("PERINGATAN: Mode AI ON tapi Proxy URL, Pool key, dan API key kosong -> semua panggilan AI akan gagal (fallback WAIT). ",
+            "Isi InpProxyUrl/InpProxyToken atau InpApiKeyPool, atau pakai MODE_AI_OFF.");
 
    return(INIT_SUCCEEDED);
 }
@@ -658,10 +691,16 @@ void RunFullAIAnalysisCycle()
 
    SFinalDecision native_decision = {};
    int raw_ai_bias = 0;
+   m_vetoed = false;
 
    if(InpMode == MODE_AI_ON)
    {
       Print("=== Memulai siklus analisa AI penuh (MODE: AI ON) ===");
+
+      // Ringkasan berita (aktual vs perkiraan) dari Kalender MT5 untuk analis berita
+      m_last_snapshot.news_digest = InpUseNewsFilter ? m_news_filter.BuildDigest()
+                                                     : "(filter berita dimatikan)";
+
       m_analyst_engine.AnalyzeAll(m_last_snapshot, m_last_opinions);
       m_last_decision = m_ai_summarizer.Summarize(m_last_opinions, m_last_snapshot);
       raw_ai_bias = (int)m_last_decision.bias;
@@ -677,6 +716,11 @@ void RunFullAIAnalysisCycle()
       Print("=== Memulai siklus analisa native (MODE: AI OFF, tanpa API) ===");
       ArrayResize(m_last_opinions, 0);
       m_last_decision = m_native_engine.Decide(m_last_snapshot, (double)InpMaxSpread, InpADXTrendThreshold);
+      // Native tidak menghitung ekspansi -> pastikan field tidak berisi sampah
+      m_last_decision.expansion_valid     = false;
+      m_last_decision.expansion_prob      = 0.0;
+      m_last_decision.invalidation_level  = 0.0;
+      m_last_decision.expansion_votes     = 0;
       native_decision = m_last_decision;
       raw_ai_bias = (int)m_last_decision.bias;
    }
@@ -708,6 +752,11 @@ void RunFullAIAnalysisCycle()
          " | Sepakat=", m_last_decision.analysts_agreed, total_label,
          (InpMode == MODE_AI_ON) ? (" | Gagal=" + IntegerToString(m_last_decision.analysts_failed) + "/10") : "",
          (m_last_decision.used_builtin_fallback ? " | [FALLBACK NATIVE DIPAKAI]" : ""));
+   if(m_last_decision.expansion_valid)
+      Print("Ekspansi (>=", DoubleToString(InpExpansionATRMult, 1), "xATR dlm ", InpJournalEvalMin, " mnt): ",
+            DoubleToString(m_last_decision.expansion_prob, 2), " dari ", m_last_decision.expansion_votes,
+            " analis | Skenario batal di: ", (m_last_decision.invalidation_level > 0.0 ?
+            DoubleToString(m_last_decision.invalidation_level, m_last_snapshot.digits) : "-"));
    Print("Alasan: ", m_last_decision.reasoning);
 }
 
@@ -742,6 +791,7 @@ void ApplyNativeGate(const SFinalDecision &native)
    if(veto)
    {
       m_last_decision.bias = FINAL_BIAS_WAIT;
+      m_vetoed = true;
       m_last_decision.reasoning += " [VETO NATIVE: " + why + "]";
       m_day_vetos++;
       Print("ApplyNativeGate: keputusan AI di-VETO -> WAIT. Alasan: ", why);
@@ -897,13 +947,40 @@ bool ShouldAllowNewTrades()
    // Keputusan terlalu basi (misal siklus tertahan lama) -> jangan dipakai
    if((TimeCurrent() - m_last_ai_analysis) > (InpAIAnalysisInterval * 3)) return false;
 
-   if(m_last_decision.bias == FINAL_BIAS_WAIT) return false;
+   // --- Gerbang EKSPANSI: grid stop-order untung dari gerak jauh, rugi di pasar sempit ---
+   bool use_expansion = (InpMode == MODE_AI_ON && InpUseExpansionGate && m_last_decision.expansion_valid);
+   if(use_expansion && m_last_decision.expansion_prob < InpMinExpansionProb) return false;
 
-   // Probabilitas terlalu rendah -> terlalu tidak yakin untuk dibuka
-   if(m_last_decision.probability < InpMinProbability) return false;
+   bool symmetric = false;
+   if(m_last_decision.bias == FINAL_BIAS_WAIT)
+   {
+      // Arah tidak jelas: hanya boleh kalau mode simetris diizinkan, ekspansi tinggi, dan tidak di-veto Native
+      symmetric = (InpAllowSymmetricGrid && use_expansion && !m_vetoed &&
+                   m_last_decision.expansion_prob >= InpSymmetricExpansionProb);
+      if(!symmetric) return false;
+   }
+   else
+   {
+      // Probabilitas arah terlalu rendah -> terlalu tidak yakin untuk dibuka
+      if(m_last_decision.probability < InpMinProbability) return false;
 
-   // Mode waspada berita + keyakinan tidak tinggi -> lebih baik tunggu
-   if(m_news_caution && m_last_decision.probability < (InpMinProbability + 0.10)) return false;
+      // Skenario sudah batal? (harga sudah melewati level pembatal sebelum grid dibangun)
+      double bid_now = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      double inv = m_last_decision.invalidation_level;
+      if(inv > 0.0)
+      {
+         if(m_last_decision.bias == FINAL_BIAS_BUY  && bid_now <= inv) return false;
+         if(m_last_decision.bias == FINAL_BIAS_SELL && bid_now >= inv) return false;
+      }
+   }
+
+   // Mode waspada berita -> syarat keyakinan dinaikkan
+   if(m_news_caution)
+   {
+      double need = (symmetric ? InpSymmetricExpansionProb : InpMinProbability) + 0.10;
+      double have = symmetric ? m_last_decision.expansion_prob : m_last_decision.probability;
+      if(have < need) return false;
+   }
 
    return true;
 }
@@ -1054,6 +1131,8 @@ void BuildSmartGrid()
       (MathMax(placed_buy, placed_sell) * ExpectedLayerLossMoney(lot_size, sl_distance) /
        AccountInfoDouble(ACCOUNT_BALANCE) * 100.0) : 0.0;
 
+   if(m_last_decision.bias == FINAL_BIAS_WAIT)
+      Print("BuildSmartGrid: MODE SIMETRIS (arah WAIT, ekspansi ", DoubleToString(m_last_decision.expansion_prob, 2), ")");
    Print("BuildSmartGrid: Buy=", placed_buy, "/", buy_orders, " (lot ", DoubleToString(buy_lot, 2), buy_side_is_minimal_hedge ? " HEDGE-MIN" : "", ")",
          " Sell=", placed_sell, "/", sell_orders, " (lot ", DoubleToString(sell_lot, 2), sell_side_is_minimal_hedge ? " HEDGE-MIN" : "", ")",
          " Step=", DoubleToString(grid_step, digits), " (x", DoubleToString(m_last_decision.grid_distance_multiplier, 2), ")",
@@ -1101,6 +1180,8 @@ double GetSmartLotSize(const int risk_layers, const int total_layers, const doub
 
    // Kurangi risiko kalau AI kurang yakin (rentang 50%-100%)
    double confidence_factor = m_has_decision ? m_last_decision.probability : 0.5;
+   if(m_has_decision && m_last_decision.bias == FINAL_BIAS_WAIT && m_last_decision.expansion_valid)
+      confidence_factor = m_last_decision.expansion_prob;   // grid simetris: keyakinan = peluang ekspansi
    double adjusted_risk = risk_amount * (0.5 + confidence_factor * 0.5);
 
    double tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE_LOSS);
@@ -1470,6 +1551,10 @@ void RefreshDashboard(string engine_msg)
       {
          ai_status += " | Sepakat: " + IntegerToString(m_last_decision.analysts_agreed) + "/10";
          ai_status += " | Gagal: " + IntegerToString(m_last_decision.analysts_failed) + "/10";
+         if(m_last_decision.expansion_valid)
+            ai_status += " | Ekspansi: " + DoubleToString(m_last_decision.expansion_prob * 100, 0) + "%";
+         if(m_last_decision.invalidation_level > 0.0)
+            ai_status += " | Batal di: " + DoubleToString(m_last_decision.invalidation_level, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
          if(m_last_decision.used_builtin_fallback) ai_status += " | [FALLBACK]";
       }
       else
@@ -1507,7 +1592,7 @@ void RefreshDashboard(string engine_msg)
    else guard = "OK";
 
    string ui = "========================================\n";
-   ui += " DIDINSKA GRID V2 v2 - " + string((InpMode == MODE_AI_ON) ? "AI ON" : "AI OFF (Native)") +
+   ui += " DIDINSKA GRID V2 v2.03 - " + string((InpMode == MODE_AI_ON) ? "AI ON" : "AI OFF (Native)") +
          (m_groq_client.IsProxyEnabled() ? " [PROXY]" : "") + "\n";
    ui += "========================================\n";
    ui += " Engine     : " + engine_msg + "\n";
