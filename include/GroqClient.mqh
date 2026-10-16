@@ -59,6 +59,18 @@ struct GroqCallResult
 //+------------------------------------------------------------------+
 //| CGroqClient - pengelola koneksi Groq API bersama                   |
 //+------------------------------------------------------------------+
+//+------------------------------------------------------------------+
+//| Provider AI yang didukung                                          |
+//+------------------------------------------------------------------+
+enum ENUM_AI_PROVIDER
+{
+   AIP_GROQ       = 0,   // Groq (OpenAI-compatible)
+   AIP_OPENROUTER = 1,   // OpenRouter (OpenAI-compatible)
+   AIP_OPENAI     = 2,   // OpenAI
+   AIP_ANTHROPIC  = 3,   // Anthropic Claude (Messages API native)
+   AIP_CUSTOM     = 4    // Custom OpenAI-compatible (FastRouter, DeepSeek, Together, dll) - isi InpAIBaseUrl
+};
+
 class CGroqClient
 {
 private:
@@ -73,6 +85,22 @@ private:
    int         m_timeout_ms;
 
    // --- Mode PROXY (Cloudflare Worker): 1 request -> Worker memanggil Groq paralel ---
+   // --- POOL KEY: banyak key (dipisah koma/baris baru), dirotasi merata ---
+   // Key yang ditolak (401/402/403) atau saldonya habis diistirahatkan 6-12 jam,
+   // key yang kena rate limit (429) diistirahatkan sebentar. Panggilan berikutnya
+   // otomatis memakai key lain yang masih hidup.
+   string      m_pool[];
+   datetime    m_pool_cooldown[];
+   datetime    m_pool_dead[];
+   int         m_pool_next;
+
+   // --- PROVIDER (v2.03): alamat, bentuk request, & field tambahan bisa dikustom ---
+   int         m_provider;          // ENUM_AI_PROVIDER
+   string      m_chat_url;          // URL lengkap endpoint (chat/completions atau messages)
+   string      m_extra_json;        // field tambahan body request (tanpa kurung kurawal)
+   bool        m_extra_override;    // true = user mengisi sendiri (dikirim juga ke Worker)
+   string      m_token_param;       // "max_tokens" atau "max_completion_tokens"
+
    bool        m_use_proxy;
    string      m_proxy_url;
    string      m_proxy_token;
@@ -103,40 +131,90 @@ private:
    // sebagai teks ter-escape. Fungsi ini membongkarnya karakter demi
    // karakter (bukan regex, MQL5 tidak punya regex native) supaya escape
    // sequence (\", \\, \n, \t) diproses dengan benar.
+   // Ambil nilai string dari field JSON pertama bernama `key` (toleran spasi/format
+   // pretty-print; melewati kemunculan yang nilainya bukan string, mis. "content":null).
+   string ExtractJsonString(const string body, const string key, const int from_pos)
+   {
+      string needle = "\"" + key + "\"";
+      int len = StringLen(body);
+      int search_from = MathMax(0, from_pos);
+
+      while(search_from < len)
+      {
+         int pos = StringFind(body, needle, search_from);
+         if(pos < 0) return "";
+
+         int i = pos + StringLen(needle);
+         while(i < len && (StringGetCharacter(body, i) == ' ' || StringGetCharacter(body, i) == '\n' ||
+                           StringGetCharacter(body, i) == '\r' || StringGetCharacter(body, i) == '\t')) i++;
+         if(i >= len || StringGetCharacter(body, i) != ':') { search_from = pos + 1; continue; }
+         i++;
+         while(i < len && (StringGetCharacter(body, i) == ' ' || StringGetCharacter(body, i) == '\n' ||
+                           StringGetCharacter(body, i) == '\r' || StringGetCharacter(body, i) == '\t')) i++;
+         if(i >= len || StringGetCharacter(body, i) != '"') { search_from = pos + 1; continue; }
+         i++;   // lewati tanda kutip pembuka
+
+         string content = "";
+         while(i < len)
+         {
+            ushort ch = StringGetCharacter(body, i);
+
+            if(ch == '\\' && i + 1 < len)
+            {
+               ushort next = StringGetCharacter(body, i + 1);
+               if(next == '"')  { content += "\""; i += 2; continue; }
+               if(next == '\\') { content += "\\"; i += 2; continue; }
+               if(next == '/')  { content += "/";  i += 2; continue; }
+               if(next == 'n')  { content += "\n"; i += 2; continue; }
+               if(next == 't')  { content += "\t"; i += 2; continue; }
+               if(next == 'r' || next == 'b' || next == 'f') { i += 2; continue; }
+               if(next == 'u' && i + 5 < len)
+               {
+                  int code = 0;
+                  bool ok = true;
+                  for(int h = 0; h < 4; h++)
+                  {
+                     ushort hc = StringGetCharacter(body, i + 2 + h);
+                     int v = -1;
+                     if(hc >= '0' && hc <= '9') v = hc - '0';
+                     else if(hc >= 'a' && hc <= 'f') v = 10 + (hc - 'a');
+                     else if(hc >= 'A' && hc <= 'F') v = 10 + (hc - 'A');
+                     if(v < 0) { ok = false; break; }
+                     code = code * 16 + v;
+                  }
+                  if(ok) { content += ShortToString((ushort)code); i += 6; continue; }
+               }
+               i += 1;   // escape tidak dikenal -> lewati backslash-nya saja
+               continue;
+            }
+
+            if(ch == '"') break;   // tanda kutip TANPA backslash = akhir string
+
+            content += StringSubstr(body, i, 1);
+            i++;
+         }
+         return content;
+      }
+      return "";
+   }
+
+   // Respons Worker (proxy) selalu ringkas: {"ok":true,"content":"..."}
    string ExtractMessageContent(const string api_response)
    {
-      string marker = "\"content\":\"";
-      int start = StringFind(api_response, marker);
-      if(start < 0) return "";
-      start += StringLen(marker);
+      return ExtractJsonString(api_response, "content", 0);
+   }
 
-      int len = StringLen(api_response);
-      string content = "";
-      int i = start;
-      while(i < len)
-      {
-         ushort ch = StringGetCharacter(api_response, i);
+   // Respons LANGSUNG dari provider (format beda-beda):
+   //   OpenAI-compatible : choices[0].message.content
+   //   Anthropic         : content[].text (blok "text"; blok "thinking" dilewati)
+   string ExtractCompletionText(const string api_response)
+   {
+      if(m_provider == AIP_ANTHROPIC)
+         return ExtractJsonString(api_response, "text", 0);
 
-         if(ch == '\\' && i + 1 < len)
-         {
-            ushort next = StringGetCharacter(api_response, i + 1);
-            if(next == '"')  { content += "\""; i += 2; continue; }
-            if(next == '\\') { content += "\\"; i += 2; continue; }
-            if(next == 'n')  { content += "\n"; i += 2; continue; }
-            if(next == 't')  { content += "\t"; i += 2; continue; }
-            if(next == 'r')  { i += 2; continue; }
-            // Escape sequence tidak dikenal -> lewati backslash-nya saja
-            i += 1;
-            continue;
-         }
-
-         if(ch == '"') break; // tanda kutip TANPA backslash = akhir string
-
-         content += StringSubstr(api_response, i, 1);
-         i++;
-      }
-
-      return content;
+      int from_pos = StringFind(api_response, "\"message\"");
+      if(from_pos < 0) from_pos = 0;
+      return ExtractJsonString(api_response, "content", from_pos);
    }
 
    //+---------------------------------------------------------------+
@@ -173,14 +251,26 @@ private:
    //+---------------------------------------------------------------+
    int SendRequest(const string api_key, const string payload, string &out_body, string &out_headers)
    {
-      string url = m_base_url + "chat/completions";
+      string url = m_chat_url;
+      if(StringLen(url) == 0)
+      {
+         Print("GroqClient: alamat API kosong. Untuk provider CUSTOM isi InpAIBaseUrl.");
+         out_body = "";
+         return -1;
+      }
 
       char post_data[];
-      StringToCharArray(payload, post_data, 0, StringLen(payload));
+      StringToCharArray(payload, post_data, 0, StringLen(payload), CP_UTF8);
 
       char result[];
-      string request_headers = "Authorization: Bearer " + api_key + "\r\n" +
-                                "Content-Type: application/json\r\n";
+      string request_headers = "";
+      if(m_provider == AIP_ANTHROPIC)
+         request_headers = "x-api-key: " + api_key + "\r\n" +
+                           "anthropic-version: 2023-06-01\r\n" +
+                           "Content-Type: application/json\r\n";
+      else
+         request_headers = "Authorization: Bearer " + api_key + "\r\n" +
+                           "Content-Type: application/json\r\n";
       out_headers = "";
 
       ResetLastError();
@@ -189,12 +279,12 @@ private:
       if(status < 0)
       {
          Print("GroqClient: WebRequest gagal total (error=", GetLastError(),
-               "). Cek apakah https://api.groq.com sudah diizinkan di Tools > Options > Expert Advisors > Allow WebRequest.");
+               "). Cek apakah ", url, " (host-nya) sudah diizinkan di Tools > Options > Expert Advisors > Allow WebRequest.");
          out_body = "";
          return -1;
       }
 
-      out_body = (ArraySize(result) > 0) ? CharArrayToString(result) : "";
+      out_body = (ArraySize(result) > 0) ? CharArrayToString(result, 0, WHOLE_ARRAY, CP_UTF8) : "";
       return status;
    }
 
@@ -205,29 +295,167 @@ private:
    {
       string safe_system = JsonEscape(system_prompt);
       string safe_user   = JsonEscape(user_prompt);
+      string temp_part   = (m_temperature >= 0.0) ? ("\"temperature\":" + DoubleToString(m_temperature, 2) + ",") : "";
 
       string payload = "{";
       payload += "\"model\":\"" + m_model + "\",";
-      payload += "\"messages\":[";
-      payload += "{\"role\":\"system\",\"content\":\"" + safe_system + "\"},";
-      payload += "{\"role\":\"user\",\"content\":\"" + safe_user + "\"}";
-      payload += "],";
-      payload += "\"max_tokens\":" + IntegerToString(m_max_tokens) + ",";
-      payload += "\"temperature\":" + DoubleToString(m_temperature, 2) + ",";
-      // PENJELASAN FIX: openai/gpt-oss-120b adalah model reasoning -- dia
-      // "berpikir" dulu (memakai sebagian max_tokens) sebelum menulis
-      // jawaban akhir. Kalau reasoning_effort dibiarkan default ("medium"),
-      // pada prompt yang kompleks (terutama AI Penyimpul yang merangkum 10
-      // opini) token bisa habis duluan di fase reasoning sebelum sempat
-      // menulis JSON -> Groq balas HTTP 400 "json_validate_failed" dengan
-      // failed_generation KOSONG (bukan salah format, tapi memang belum
-      // sempat menulis apa-apa). "low" mengurangi token yang dipakai untuk
-      // reasoning, menyisakan lebih banyak jatah untuk JSON akhir.
-      payload += "\"reasoning_effort\":\"low\",";
-      payload += "\"response_format\":{\"type\":\"json_object\"}";
-      payload += "}";
 
+      if(m_provider == AIP_ANTHROPIC)
+      {
+         // Anthropic Messages API: system terpisah dari messages
+         payload += "\"max_tokens\":" + IntegerToString(m_max_tokens) + ",";
+         payload += temp_part;
+         payload += "\"system\":\"" + safe_system + "\",";
+         payload += "\"messages\":[{\"role\":\"user\",\"content\":\"" + safe_user + "\"}]";
+      }
+      else
+      {
+         // OpenAI-compatible (Groq, OpenRouter, OpenAI, custom)
+         payload += "\"messages\":[";
+         payload += "{\"role\":\"system\",\"content\":\"" + safe_system + "\"},";
+         payload += "{\"role\":\"user\",\"content\":\"" + safe_user + "\"}";
+         payload += "],";
+         payload += temp_part;
+         payload += "\"" + m_token_param + "\":" + IntegerToString(m_max_tokens);
+      }
+
+      // Field tambahan khusus provider/model (mis. reasoning_effort, response_format).
+      // Bawaan Groq: reasoning_effort=low supaya model reasoning tidak menghabiskan
+      // max_tokens untuk berpikir sebelum sempat menulis JSON (HTTP 400 json_validate_failed).
+      string extra = m_extra_json;
+      StringTrimLeft(extra);
+      StringTrimRight(extra);
+      while(StringLen(extra) > 0 && StringGetCharacter(extra, 0) == ',')
+         extra = StringSubstr(extra, 1);
+      while(StringLen(extra) > 0 && StringGetCharacter(extra, StringLen(extra) - 1) == ',')
+         extra = StringSubstr(extra, 0, StringLen(extra) - 1);
+      if(StringLen(extra) > 0)
+         payload += "," + extra;
+
+      payload += "}";
       return payload;
+   }
+
+   //+---------------------------------------------------------------+
+   //| BLOK POOL KEY: rotasi banyak key                                   |
+   //+---------------------------------------------------------------+
+   string MaskKey(const string key)
+   {
+      int n = StringLen(key);
+      return "..." + ((n > 4) ? StringSubstr(key, n - 4) : key);
+   }
+
+   bool PoolContains(const string key)
+   {
+      for(int i = 0; i < ArraySize(m_pool); i++)
+         if(m_pool[i] == key) return true;
+      return false;
+   }
+
+   // Satu panggilan memakai pool: coba sampai 6 key hidup berbeda, mulai dari
+   // key giliran berikutnya (rotasi merata, bukan selalu key pertama).
+   bool PoolCall(const string payload, GroqCallResult &result)
+   {
+      int n = ArraySize(m_pool);
+      if(n == 0) return false;
+
+      datetime now = TimeCurrent();
+      int max_attempts = MathMin(n, 6);
+      int tried = 0;
+
+      for(int step = 0; step < n && tried < max_attempts; step++)
+      {
+         int idx = (m_pool_next + step) % n;
+         if(m_pool_dead[idx] > now || m_pool_cooldown[idx] > now) continue;
+
+         tried++;
+         m_pool_next = (idx + 1) % n;
+
+         string body = "";
+         string headers = "";
+         int status = SendRequest(m_pool[idx], payload, body, headers);
+         result.http_status = status;
+
+         if(status == 200 && body != "")
+         {
+            string inner = ExtractCompletionText(body);
+            if(inner == "")
+            {
+               result.success = false;
+               result.error_message = "Pool: HTTP 200 tapi gagal membongkar field content";
+               return false;
+            }
+            result.success = true;
+            result.content = inner;
+            result.error_message = "";
+            return true;
+         }
+
+         if(status < 0)
+         {
+            // WebRequest gagal total (URL belum diizinkan / tidak ada internet) -> bukan salah key
+            result.success = false;
+            result.error_message = "Pool: WebRequest gagal total";
+            return false;
+         }
+
+         if(status == 401 || status == 402 || status == 403)
+         {
+            m_pool_dead[idx] = now + (12 * 3600);
+            Print("GroqClient[POOL]: key ", MaskKey(m_pool[idx]), " ditolak (HTTP ", status, ") -> diistirahatkan 12 jam.");
+         }
+         else if(status == 429)
+         {
+            string lower = body;
+            StringToLower(lower);
+            bool exhausted = (StringFind(lower, "quota") >= 0 || StringFind(lower, "billing") >= 0 ||
+                              StringFind(lower, "credit") >= 0 || StringFind(lower, "insufficient") >= 0 ||
+                              StringFind(lower, "spend") >= 0  || StringFind(lower, "balance") >= 0);
+            if(exhausted)
+            {
+               m_pool_dead[idx] = now + (6 * 3600);
+               Print("GroqClient[POOL]: key ", MaskKey(m_pool[idx]), " tampaknya habis saldo/kuota -> diistirahatkan 6 jam.");
+            }
+            else
+            {
+               int retry_after = ExtractRetryAfterSeconds(headers);
+               if(retry_after <= 0) retry_after = 60;
+               m_pool_cooldown[idx] = now + retry_after;
+               Print("GroqClient[POOL]: key ", MaskKey(m_pool[idx]), " kena rate limit, cooldown ", retry_after, " detik.");
+            }
+         }
+         else if(status >= 500)
+         {
+            // gangguan sisi Groq: coba key berikutnya saja
+         }
+         else
+         {
+            string lower400 = body;
+            StringToLower(lower400);
+            bool credit_words = (StringFind(lower400, "credit") >= 0 || StringFind(lower400, "billing") >= 0 ||
+                                 StringFind(lower400, "quota") >= 0  || StringFind(lower400, "balance") >= 0);
+            if(status == 400 && credit_words)
+            {
+               // mis. Anthropic: "credit balance is too low" -> key habis saldo, bukan salah payload
+               m_pool_dead[idx] = now + (6 * 3600);
+               Print("GroqClient[POOL]: key ", MaskKey(m_pool[idx]), " habis kredit (HTTP 400) -> diistirahatkan 6 jam.");
+            }
+            else
+            {
+               // 400/404 dsb: payload/model bermasalah, mengganti key tidak akan membantu
+               string snippet = (StringLen(body) > 200) ? StringSubstr(body, 0, 200) : body;
+               Print("GroqClient[POOL]: HTTP ", status, " body=", snippet);
+               result.success = false;
+               result.error_message = "Pool: HTTP status " + IntegerToString(status);
+               return false;
+            }
+         }
+      }
+
+      result.success = false;
+      result.error_message = "Pool: tidak ada key yang berhasil (dicoba " + IntegerToString(tried) +
+                             " key, hidup " + IntegerToString(PoolAliveCount()) + "/" + IntegerToString(n) + ")";
+      return false;
    }
 
    //+---------------------------------------------------------------+
@@ -240,13 +468,38 @@ private:
       return false;
    }
 
+   // Bagian umum body ke Worker. Alamat provider SENGAJA TIDAK dikirim
+   // (ditetapkan di Worker) supaya token yang bocor tidak bisa dipakai
+   // mengarahkan key Anda ke server lain.
+   string ProviderId()
+   {
+      switch(m_provider)
+      {
+         case AIP_OPENROUTER: return "openrouter";
+         case AIP_OPENAI:     return "openai";
+         case AIP_ANTHROPIC:  return "anthropic";
+         case AIP_CUSTOM:     return "custom";
+         default:             return "groq";
+      }
+   }
+
+   string BuildProxyCommon()
+   {
+      string b = "\"provider\":\"" + ProviderId() + "\",";
+      b += "\"model\":\"" + JsonEscape(m_model) + "\",";
+      b += "\"max_tokens\":" + IntegerToString(m_max_tokens) + ",";
+      b += (m_temperature >= 0.0) ? ("\"temperature\":" + DoubleToString(m_temperature, 2))
+                                  : "\"temperature\":null";
+      if(m_extra_override)
+         b += ",\"extra\":{" + m_extra_json + "}";   // kosong -> {} = tanpa tambahan
+      return b;
+   }
+
    // Body request untuk 1 panggilan tunggal ke Worker (/call)
    string BuildProxyCallBody(const string system_prompt, const string user_prompt)
    {
       string b = "{";
-      b += "\"model\":\"" + m_model + "\",";
-      b += "\"max_tokens\":" + IntegerToString(m_max_tokens) + ",";
-      b += "\"temperature\":" + DoubleToString(m_temperature, 2) + ",";
+      b += BuildProxyCommon() + ",";
       b += "\"system\":\"" + JsonEscape(system_prompt) + "\",";
       b += "\"user\":\"" + JsonEscape(user_prompt) + "\"";
       b += "}";
@@ -320,7 +573,7 @@ private:
 
       if(status == 200 && body != "")
       {
-         string inner = ExtractMessageContent(body);
+         string inner = ExtractCompletionText(body);
          if(inner == "")
          {
             result.success = false;
@@ -361,6 +614,15 @@ public:
    CGroqClient()
    {
       m_base_url    = "https://api.groq.com/openai/v1/";
+      ArrayResize(m_pool, 0);
+      ArrayResize(m_pool_cooldown, 0);
+      ArrayResize(m_pool_dead, 0);
+      m_pool_next   = 0;
+      m_provider       = AIP_GROQ;
+      m_chat_url       = "https://api.groq.com/openai/v1/chat/completions";
+      m_extra_json     = "\"reasoning_effort\":\"low\",\"response_format\":{\"type\":\"json_object\"}";
+      m_extra_override = false;
+      m_token_param    = "max_tokens";
       m_use_proxy   = false;
       m_proxy_url   = "";
       m_proxy_token = "";
@@ -402,7 +664,7 @@ public:
          m_cooldown_until[i] = 0;
       }
 
-      if(!m_use_proxy && !m_key_filled[GROQ_RESERVE_SLOT])
+      if(!m_use_proxy && ArraySize(m_pool) == 0 && !m_key_filled[GROQ_RESERVE_SLOT])
       {
          Print("GroqClient PERINGATAN: slot cadangan (slot 12) kosong. ",
                "Kalau salah satu dari 11 slot lain kena rate limit, TIDAK ADA fallback.");
@@ -422,6 +684,147 @@ public:
    {
       if(slot < 0 || slot >= GROQ_TOTAL_SLOTS) return true;
       return TimeCurrent() < m_cooldown_until[slot];
+   }
+
+   //+---------------------------------------------------------------+
+   //| PROVIDER: pilih provider, alamat, field tambahan                  |
+   //+---------------------------------------------------------------+
+   // base_url   : kosong = bawaan provider. Boleh alamat dasar (".../v1") atau
+   //              alamat lengkap (".../chat/completions" / ".../messages").
+   // extra_json : "auto" = bawaan provider; "" = tanpa tambahan; selain itu pakai
+   //              teks Anda (potongan JSON TANPA kurung kurawal), mis.
+   //              "reasoning_effort":"low","response_format":{"type":"json_object"}
+   // token_param: "auto" atau nama field batas token ("max_tokens" / "max_completion_tokens")
+   // CATATAN: di mode Worker, alamat provider ditentukan di Worker, bukan di sini.
+   void SetProvider(const int provider, const string base_url, const string extra_json, const string token_param)
+   {
+      m_provider = provider;
+
+      string base = base_url;
+      StringTrimLeft(base);
+      StringTrimRight(base);
+      if(StringLen(base) == 0)
+      {
+         switch(provider)
+         {
+            case AIP_OPENROUTER: base = "https://openrouter.ai/api/v1";  break;
+            case AIP_OPENAI:     base = "https://api.openai.com/v1";     break;
+            case AIP_ANTHROPIC:  base = "https://api.anthropic.com/v1";   break;
+            case AIP_CUSTOM:     base = "";                               break;
+            default:             base = "https://api.groq.com/openai/v1"; break;
+         }
+      }
+      while(StringLen(base) > 0 && StringGetCharacter(base, StringLen(base) - 1) == '/')
+         base = StringSubstr(base, 0, StringLen(base) - 1);
+
+      if(StringLen(base) == 0)
+         m_chat_url = "";
+      else if(StringFind(base, "/chat/completions") >= 0 || StringFind(base, "/messages") >= 0)
+         m_chat_url = base;                                                  // sudah alamat lengkap
+      else
+         m_chat_url = base + ((provider == AIP_ANTHROPIC) ? "/messages" : "/chat/completions");
+
+      string extra = extra_json;
+      StringTrimLeft(extra);
+      StringTrimRight(extra);
+      string extra_lower = extra;
+      StringToLower(extra_lower);
+      if(extra_lower == "auto")
+      {
+         m_extra_override = false;
+         switch(provider)
+         {
+            case AIP_GROQ:       m_extra_json = "\"reasoning_effort\":\"low\",\"response_format\":{\"type\":\"json_object\"}"; break;
+            case AIP_OPENROUTER:
+            case AIP_OPENAI:     m_extra_json = "\"response_format\":{\"type\":\"json_object\"}"; break;
+            default:             m_extra_json = ""; break;
+         }
+      }
+      else
+      {
+         m_extra_override = true;
+         m_extra_json = extra;
+      }
+
+      string tp = token_param;
+      StringTrimLeft(tp);
+      StringTrimRight(tp);
+      string tp_lower = tp;
+      StringToLower(tp_lower);
+      if(StringLen(tp) == 0 || tp_lower == "auto")
+         m_token_param = (provider == AIP_OPENAI) ? "max_completion_tokens" : "max_tokens";
+      else
+         m_token_param = tp;
+
+      Print("GroqClient: provider=", ProviderId(), " | alamat langsung=", (StringLen(m_chat_url) > 0 ? m_chat_url : "(kosong)"),
+            " | field token=", m_token_param, " | tambahan=", (m_extra_override ? "kustom" : "bawaan"));
+   }
+
+   //+---------------------------------------------------------------+
+   //| POOL KEY: tambah banyak key sekaligus                              |
+   //+---------------------------------------------------------------+
+   // Menerima teks berisi key dipisah koma, titik-koma, spasi, atau baris baru.
+   // Duplikat dibuang. Mengembalikan jumlah key BARU yang ditambahkan.
+   int AddKeysFromText(const string text)
+   {
+      int added = 0;
+      string cur = "";
+      int len = StringLen(text);
+
+      for(int i = 0; i <= len; i++)
+      {
+         ushort ch = (i < len) ? StringGetCharacter(text, i) : (ushort)',';
+         bool is_sep = (ch == ',' || ch == ';' || ch == ' ' || ch == '\n' || ch == '\r' || ch == '\t');
+         if(!is_sep)
+         {
+            cur += ShortToString(ch);
+            continue;
+         }
+
+         if(StringLen(cur) >= 10 && !PoolContains(cur))
+         {
+            int n = ArraySize(m_pool);
+            ArrayResize(m_pool, n + 1);
+            ArrayResize(m_pool_cooldown, n + 1);
+            ArrayResize(m_pool_dead, n + 1);
+            m_pool[n] = cur;
+            m_pool_cooldown[n] = 0;
+            m_pool_dead[n] = 0;
+            added++;
+         }
+         cur = "";
+      }
+      return added;
+   }
+
+   // Baca key dari file di folder MQL5\Files (dipisah koma atau baris baru).
+   // Cocok untuk puluhan/ratusan key karena kolom input MT5 terbatas panjangnya.
+   int LoadKeysFromFile(const string filename)
+   {
+      int h = FileOpen(filename, FILE_READ | FILE_TXT | FILE_ANSI | FILE_SHARE_READ);
+      if(h == INVALID_HANDLE)
+      {
+         Print("GroqClient[POOL]: file key '", filename, "' tidak ditemukan di MQL5\\Files (dilewati).");
+         return 0;
+      }
+
+      string all = "";
+      while(!FileIsEnding(h))
+         all += FileReadString(h) + ",";
+      FileClose(h);
+
+      return AddKeysFromText(all);
+   }
+
+   int PoolSize() { return ArraySize(m_pool); }
+
+   int PoolAliveCount()
+   {
+      datetime now = TimeCurrent();
+      int alive = 0;
+      for(int i = 0; i < ArraySize(m_pool); i++)
+         if(m_pool_dead[i] <= now) alive++;
+      return alive;
    }
 
    //+---------------------------------------------------------------+
@@ -466,9 +869,7 @@ public:
       if(!m_use_proxy || n <= 0) return false;
 
       string b = "{";
-      b += "\"model\":\"" + m_model + "\",";
-      b += "\"max_tokens\":" + IntegerToString(m_max_tokens) + ",";
-      b += "\"temperature\":" + DoubleToString(m_temperature, 2) + ",";
+      b += BuildProxyCommon() + ",";
       b += "\"items\":[";
       for(int i = 0; i < n; i++)
       {
@@ -581,7 +982,7 @@ public:
             result.used_reserve_key = false;
             return result;
          }
-         if(!AnyDirectKeyFilled())
+         if(!AnyDirectKeyFilled() && ArraySize(m_pool) == 0)
          {
             Print("GroqClient: proxy gagal (", result.error_message,
                   ") dan tidak ada API key langsung sebagai cadangan.");
@@ -591,6 +992,21 @@ public:
       }
 
       string payload = BuildPayload(system_prompt, user_prompt);
+
+      // POOL KEY (banyak key dirotasi). Kalau pool gagal total dan ada slot lama -> lanjut ke slot.
+      if(ArraySize(m_pool) > 0)
+      {
+         if(PoolCall(payload, result))
+         {
+            result.used_reserve_key = false;
+            return result;
+         }
+         if(!AnyDirectKeyFilled())
+         {
+            Print("GroqClient: pool key gagal (", result.error_message, ").");
+            return result;
+         }
+      }
 
       bool primary_usable = m_key_filled[slot] && !IsSlotCoolingDown(slot);
       bool primary_is_reserve = (slot == GROQ_RESERVE_SLOT);
